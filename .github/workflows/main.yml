@@ -17,7 +17,7 @@ jobs:
       # Step 1: Create the codyuser account
       - name: Cody - Create User
         env:
-          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORDD }}   # Secret name unchanged
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORDD }}
         run: |
           $password = $env:RUSTDESK_PASSWORD
           $username = "codyuser"
@@ -71,56 +71,70 @@ jobs:
           secedit /configure /db secedit.sdb /cfg $secpolPath /areas USER_RIGHTS | Out-Null
           Write-Host "Cody: Rights granted"
 
-      # Step 3: Switch to codyuser, download/install/configure RustDesk
-      - name: Cody - Setup RustDesk as codyuser
+      # Step 3: Download and install RustDesk (as admin)
+      - name: Cody - Install RustDesk
         run: |
-          $username = $env:CODY_USER
-          $password = $env:CODY_PASS
-          $computerName = $env:COMPUTERNAME
-          $fullUsername = "$computerName\$username"
-          
-          # Prepare a script to run as codyuser, using environment variable for password
-          $scriptContent = @'
           Write-Host "Cody: Downloading RustDesk..."
-          $installer = "C:\Users\Public\Downloads\rustdesk.exe"
-          New-Item -ItemType Directory -Path "C:\Users\Public\Downloads" -Force | Out-Null
+          $installer = "$env:TEMP\rustdesk.exe"
           Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-x86_64.exe" -OutFile $installer
           
           Write-Host "Cody: Installing RustDesk..."
           Start-Process -FilePath $installer -ArgumentList "--silent-install" -Wait -NoNewWindow
           Start-Sleep -Seconds 15
           
+          Write-Host "Cody: Verifying installation..."
+          if (!(Test-Path "C:\Program Files\RustDesk\rustdesk.exe")) {
+              Write-Error "Cody: RustDesk installation failed"
+              exit 1
+          }
+          Write-Host "Cody: Installation verified"
+
+      # Step 4: Configure RustDesk service to run as codyuser
+      - name: Cody - Configure Service
+        run: |
+          $username = $env:CODY_USER
+          $password = $env:CODY_PASS
+          $computerName = $env:COMPUTERNAME
+          $fullUsername = "$computerName\$username"
+          
+          Write-Host "Cody: Stopping RustDesk service..."
+          Stop-Service -Name "RustDesk" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          
+          Write-Host "Cody: Setting service to run as $fullUsername ..."
+          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+          $credential = New-Object System.Management.Automation.PSCredential($fullUsername, $securePassword)
+          
+          Set-Service -Name "RustDesk" -Credential $credential
+          Write-Host "Cody: Service credential updated"
+
+      # Step 5: Set RustDesk password as codyuser (via CLI)
+      - name: Cody - Set RustDesk Password
+        run: |
+          $username = $env:CODY_USER
+          $password = $env:CODY_PASS
+          $computerName = $env:COMPUTERNAME
+          $fullUsername = "$computerName\$username"
+          
+          # Write a small script to run as codyuser
+          $scriptContent = @'
           Write-Host "Cody: Setting RustDesk password via CLI..."
           $password = $env:CODY_PASS
           & "C:\Program Files\RustDesk\rustdesk.exe" --password $password
-          Start-Sleep -Seconds 5
-          
-          Write-Host "Cody: Starting RustDesk..."
-          Start-Process "C:\Program Files\RustDesk\rustdesk.exe"
-          Start-Sleep -Seconds 10
-          
-          Write-Host "Cody: Getting RustDesk ID..."
-          $id = (& "C:\Program Files\RustDesk\rustdesk.exe" --get-id 2>&1 | Out-String).Trim()
-          
-          # Save ID to a file in Public to avoid permission issues
-          Set-Content -Path "C:\Users\Public\rustdesk_id.txt" -Value $id -Force
-          Write-Host "Cody: ID saved: $id"
+          Start-Sleep -Seconds 3
+          Write-Host "Cody: Password set"
           '@
           
-          $scriptPath = "C:\Users\Public\setup_rustdesk.ps1"
+          $scriptPath = "C:\Users\Public\set_rustdesk_password.ps1"
           Set-Content -Path $scriptPath -Value $scriptContent -Force
-          
-          # Give codyuser permission to read the script (if needed)
-          icacls $scriptPath /grant "${username}:(R)" | Out-Null
           
           $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
           $credential = New-Object System.Management.Automation.PSCredential($fullUsername, $securePassword)
           
-          Write-Host "Cody: Running setup as $fullUsername ..."
-          $outLog = "C:\Users\Public\rustdesk_out.log"
-          $errLog = "C:\Users\Public\rustdesk_err.log"
+          $outLog = "C:\Users\Public\set_rustdesk_out.log"
+          $errLog = "C:\Users\Public\set_rustdesk_err.log"
           
-          # Run with password passed as environment variable
+          Write-Host "Cody: Running password set as $fullUsername ..."
           $process = Start-Process -FilePath "pwsh" `
               -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" `
               -Credential $credential `
@@ -132,30 +146,81 @@ jobs:
               -PassThru `
               -Environment @{ CODY_PASS = $password }
           
-          Write-Host "Cody: Child process exit code: $($process.ExitCode)"
-          Write-Host "--- Child process stdout ---"
+          Write-Host "Cody: Password set process exit code: $($process.ExitCode)"
+          Write-Host "--- stdout ---"
           if (Test-Path $outLog) { Get-Content $outLog | ForEach-Object { Write-Host $_ } }
-          Write-Host "--- Child process stderr ---"
+          Write-Host "--- stderr ---"
           if (Test-Path $errLog) { Get-Content $errLog | ForEach-Object { Write-Host $_ } }
           
           if ($process.ExitCode -ne 0) {
-              Write-Error "Cody: Setup script failed with exit code $($process.ExitCode)"
-              exit 1
-          }
-          
-          # Read the ID from the file
-          $idFile = "C:\Users\Public\rustdesk_id.txt"
-          if (Test-Path $idFile) {
-              $rustdeskId = (Get-Content $idFile -Raw).Trim()
-              Write-Host "Cody: Retrieved ID from file: $rustdeskId"
-              Add-Content -Path $env:GITHUB_ENV -Value "RUSTDESK_ID=$rustdeskId"
-          }
-          else {
-              Write-Error "Cody: Failed to retrieve RustDesk ID file"
+              Write-Error "Cody: Password set failed"
               exit 1
           }
 
-      # Step 4: Keep the session alive
+      # Step 6: Start RustDesk service and get ID
+      - name: Cody - Start Service and Get ID
+        run: |
+          Write-Host "Cody: Starting RustDesk service..."
+          Start-Service -Name "RustDesk"
+          Start-Sleep -Seconds 15
+          
+          Write-Host "Cody: Retrieving RustDesk ID..."
+          # Read the ID from codyuser's config file (since service runs as codyuser)
+          $configPath = "C:\Users\$env:CODY_USER\AppData\Roaming\RustDesk\config\RustDesk2.toml"
+          if (Test-Path $configPath) {
+              $content = Get-Content $configPath -Raw
+              if ($content -match '^id\s*=\s*"([^"]+)"') {
+                  $rustdeskId = $Matches[1]
+              } elseif ($content -match '^id\s*=\s*''([^'']+)''') {
+                  $rustdeskId = $Matches[1]
+              }
+          }
+          
+          if ([string]::IsNullOrWhiteSpace($rustdeskId)) {
+              # Fallback: run rustdesk --get-id as codyuser
+              Write-Host "Cody: Falling back to CLI --get-id..."
+              $scriptContent = @'
+              & "C:\Program Files\RustDesk\rustdesk.exe" --get-id
+              '@
+              $scriptPath = "C:\Users\Public\get_id.ps1"
+              Set-Content -Path $scriptPath -Value $scriptContent -Force
+              
+              $securePassword = ConvertTo-SecureString -String $env:CODY_PASS -AsPlainText -Force
+              $credential = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$env:CODY_USER", $securePassword)
+              
+              $outLog = "C:\Users\Public\get_id_out.log"
+              $errLog = "C:\Users\Public\get_id_err.log"
+              
+              $process = Start-Process -FilePath "pwsh" `
+                  -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" `
+                  -Credential $credential `
+                  -Wait `
+                  -LoadUserProfile `
+                  -NoNewWindow `
+                  -RedirectStandardOutput $outLog `
+                  -RedirectStandardError $errLog `
+                  -PassThru
+              
+              if ($process.ExitCode -eq 0) {
+                  $rustdeskId = (Get-Content $outLog -Raw).Trim()
+              }
+          }
+          
+          if ([string]::IsNullOrWhiteSpace($rustdeskId)) {
+              Write-Error "Cody: Failed to retrieve RustDesk ID"
+              exit 1
+          }
+          
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "CODY RUSTDESK ID : $rustdeskId"
+          Write-Host "CODY PASSWORD    : [HIDDEN]"
+          Write-Host "========================================"
+          Write-Host ""
+          
+          Add-Content -Path $env:GITHUB_ENV -Value "RUSTDESK_ID=$rustdeskId"
+
+      # Step 7: Keep session active
       - name: Cody - Session Active
         run: |
           $hours = [int]"${{ github.event.inputs.session_duration }}"
