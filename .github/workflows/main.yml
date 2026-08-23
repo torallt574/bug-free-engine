@@ -164,46 +164,29 @@ jobs:
           }
           Write-Host "Cody: Password set and service restarted."
 
-      # Step 7: Retrieve the correct ID from codyuser's config
+      # Step 7: Retrieve the correct ID by running --get-id as codyuser
       - name: Cody - Get RustDesk ID
         run: |
-          Write-Host "Cody: Retrieving RustDesk ID from codyuser profile..."
+          Write-Host "Cody: Retrieving RustDesk ID as codyuser..."
           $username = $env:CODY_USER
-          $configPath = "C:\Users\$username\AppData\Roaming\RustDesk\config\RustDesk2.toml"
+          $password = $env:CODY_PASS
+          $computerName = $env:COMPUTERNAME
+          $fullUsername = "$computerName\$username"
           
-          # Wait for the config file to be created by the service
-          $timeout = 0
-          while (!(Test-Path $configPath) -and $timeout -lt 30) {
-              Write-Host "Cody: Waiting for config file..."
-              Start-Sleep -Seconds 2
-              $timeout++
-          }
+          # Create a small script that runs rustdesk --get-id and prints the result
+          $scriptPath = "C:\Users\Public\get_rustdesk_id.ps1"
+          Set-Content -Path $scriptPath -Value '& "C:\Program Files\RustDesk\rustdesk.exe" --get-id' -Force
+          
+          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+          $credential = New-Object System.Management.Automation.PSCredential($fullUsername, $securePassword)
           
           $id = ""
-          if (Test-Path $configPath) {
-              $content = Get-Content $configPath -Raw
-              Write-Host "Cody: Config file found (masked):"
-              Write-Host ($content -replace 'permanent-password.*', 'permanent-password = [REDACTED]')
-              if ($content -match '^id\s*=\s*"([^"]+)"') {
-                  $id = $Matches[1]
-              } elseif ($content -match '^id\s*=\s*''([^'']+)''') {
-                  $id = $Matches[1]
-              }
-          }
-          
-          # Fallback: run rustdesk --get-id as codyuser (not admin)
-          if ([string]::IsNullOrWhiteSpace($id)) {
-              Write-Host "Cody: Falling back to CLI --get-id as codyuser..."
-              $securePassword = ConvertTo-SecureString -String $env:CODY_PASS -AsPlainText -Force
-              $credential = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$env:CODY_USER", $securePassword)
+          $retries = 0
+          while ([string]::IsNullOrWhiteSpace($id) -and $retries -lt 10) {
+              $outLog = "C:\Users\Public\get_id_out_$retries.log"
+              $errLog = "C:\Users\Public\get_id_err_$retries.log"
               
-              # Run a small script as codyuser to get the ID
-              $scriptPath = "C:\Users\Public\get_rustdesk_id.ps1"
-              Set-Content -Path $scriptPath -Value '& "C:\Program Files\RustDesk\rustdesk.exe" --get-id' -Force
-              
-              $outLog = "C:\Users\Public\get_id_out.log"
-              $errLog = "C:\Users\Public\get_id_err.log"
-              
+              Write-Host "Cody: Attempt $($retries+1) to get ID..."
               $process = Start-Process -FilePath "pwsh" `
                   -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" `
                   -Credential $credential `
@@ -216,6 +199,16 @@ jobs:
               
               if ($process.ExitCode -eq 0 -and (Test-Path $outLog)) {
                   $id = (Get-Content $outLog -Raw).Trim()
+                  if ([string]::IsNullOrWhiteSpace($id)) {
+                      Write-Host "Cody: ID empty, waiting..."
+                      Start-Sleep -Seconds 5
+                      $retries++
+                  }
+              }
+              else {
+                  Write-Host "Cody: Command failed (exit code $($process.ExitCode)), retrying..."
+                  Start-Sleep -Seconds 5
+                  $retries++
               }
           }
           
