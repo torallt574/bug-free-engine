@@ -14,285 +14,151 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Cody - Install
+      # Step 1: Create the codyuser account
+      - name: Cody - Create User
+        env:
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORDD }}   # Secret name unchanged
         run: |
-          $rdUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-x86_64.exe"
-          $installer = "$env:TEMP\rustdesk_installer.exe"
+          $password = $env:RUSTDESK_PASSWORD
+          $username = "codyuser"
+          
+          Write-Host "Cody: Creating user '$username'..."
+          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+          
+          try {
+              Get-LocalUser -Name $username -ErrorAction Stop
+              Write-Host "Cody: User already exists"
+          }
+          catch {
+              New-LocalUser -Name $username -Password $securePassword -PasswordNeverExpires -Description "RustDesk Service User"
+              Write-Host "Cody: User created"
+          }
+          
+          Write-Host "Cody: Adding user to Administrators..."
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Write-Host "Cody: User setup complete"
+          
+          # Store credentials for later steps
+          Add-Content -Path $env:GITHUB_ENV -Value "CODY_USER=$username"
+          Add-Content -Path $env:GITHUB_ENV -Value "CODY_PASS=$password"
+
+      # Step 2: Grant logon rights so we can run processes as codyuser
+      - name: Cody - Grant Logon Rights
+        run: |
+          $username = $env:CODY_USER
+          $computerName = $env:COMPUTERNAME
+          $fullUsername = "$computerName\$username"
+          
+          Write-Host "Cody: Granting 'Log on as a batch job' and 'Log on as a service' to $fullUsername"
+          
+          $secpolPath = "$env:TEMP\secpol.cfg"
+          secedit /export /cfg $secpolPath | Out-Null
+          
+          $sid = (New-Object System.Security.Principal.NTAccount($fullUsername)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          
+          $content = Get-Content $secpolPath
+          $newContent = foreach ($line in $content) {
+              if ($line -match "^SeServiceLogonRight\s*=" -and $line -notmatch [regex]::Escape($sid)) {
+                  $line = $line.TrimEnd() + ",*$sid"
+              }
+              if ($line -match "^SeBatchLogonRight\s*=" -and $line -notmatch [regex]::Escape($sid)) {
+                  $line = $line.TrimEnd() + ",*$sid"
+              }
+              $line
+          }
+          $newContent | Set-Content $secpolPath -Force
+          
+          secedit /configure /db secedit.sdb /cfg $secpolPath /areas USER_RIGHTS | Out-Null
+          Write-Host "Cody: Rights granted"
+
+      # Step 3: Switch to codyuser, download/install/configure RustDesk
+      - name: Cody - Setup RustDesk as codyuser
+        env:
+          CODY_USER: ${{ env.CODY_USER }}
+          CODY_PASS: ${{ env.CODY_PASS }}
+        run: |
+          $username = $env:CODY_USER
+          $password = $env:CODY_PASS
+          $computerName = $env:COMPUTERNAME
+          $fullUsername = "$computerName\$username"
+          
+          # Prepare a script to run as codyuser
+          $scriptContent = @"
+          param([string]`$Password)
           
           Write-Host "Cody: Downloading RustDesk..."
-          Invoke-WebRequest -Uri $rdUrl -OutFile $installer
+          `$installer = "C:\Users\$username\Downloads\rustdesk.exe"
+          New-Item -ItemType Directory -Path "C:\Users\$username\Downloads" -Force | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-x86_64.exe" -OutFile `$installer
           
-          Write-Host "Cody: Starting Silent Install (Waiting for completion)..."
-          $process = Start-Process -FilePath $installer -ArgumentList "--silent-install" -PassThru -NoNewWindow
-          $process.WaitForExit()
+          Write-Host "Cody: Installing RustDesk..."
+          Start-Process -FilePath `$installer -ArgumentList "--silent-install" -Wait -NoNewWindow
+          Start-Sleep -Seconds 10
           
-          Write-Host "Cody: Waiting for service installation to complete..."
-          $timeout = 0
-          while (!(Get-Service -Name "RustDesk" -ErrorAction SilentlyContinue) -and $timeout -lt 30) {
-              Start-Sleep -Seconds 2
-              $timeout++
+          Write-Host "Cody: Setting RustDesk password via CLI..."
+          & "C:\Program Files\RustDesk\rustdesk.exe" --password `$Password
+          Start-Sleep -Seconds 3
+          
+          Write-Host "Cody: Starting RustDesk..."
+          Start-Process "C:\Program Files\RustDesk\rustdesk.exe"
+          Start-Sleep -Seconds 5
+          
+          Write-Host "Cody: Getting RustDesk ID..."
+          `$id = (& "C:\Program Files\RustDesk\rustdesk.exe" --get-id 2>&1 | Out-String).Trim()
+          
+          # Save ID to a file readable by the main runner
+          Set-Content -Path "C:\Users\$username\rustdesk_id.txt" -Value `$id -Force
+          Write-Host "Cody: ID saved: `$id"
+          "@
+          
+          $scriptPath = "$env:TEMP\setup_rustdesk.ps1"
+          Set-Content -Path $scriptPath -Value $scriptContent -Force
+          
+          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+          $credential = New-Object System.Management.Automation.PSCredential($fullUsername, $securePassword)
+          
+          Write-Host "Cody: Running setup as $fullUsername ..."
+          Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`" -Password `"$password`"" `
+              -Credential $credential -Wait -LoadUserProfile -NoNewWindow
+          
+          # Read the ID from the file
+          $idFile = "C:\Users\$username\rustdesk_id.txt"
+          if (Test-Path $idFile) {
+              $rustdeskId = (Get-Content $idFile -Raw).Trim()
+              Write-Host "Cody: Retrieved ID from file: $rustdeskId"
+              Add-Content -Path $env:GITHUB_ENV -Value "RUSTDESK_ID=$rustdeskId"
           }
-          
-          $timeout = 0
-          while ((Get-Service -Name "RustDesk").Status -ne 'Running' -and $timeout -lt 30) {
-              Start-Sleep -Seconds 2
-              $timeout++
+          else {
+              Write-Error "Cody: Failed to retrieve RustDesk ID"
+              exit 1
           }
-          Write-Host "Cody: ✓ RustDesk installed and running."
 
-      - name: Cody - Create Admin User
-        env:
-          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORDD }}
-        run: |
-          $rdPass = $env:RUSTDESK_PASSWORD
-          
-          if ([string]::IsNullOrWhiteSpace($rdPass)) {
-              Write-Error "Cody: RUSTDESK_PASSWORD secret is empty or not configured."
-              exit 1
-          }
-          
-          $adminUsername = "admin"
-          Write-Host "========================================"
-          Write-Host "Cody: Creating local admin user..."
-          Write-Host "========================================"
-          
-          try {
-              $existingUser = Get-LocalUser -Name $adminUsername -ErrorAction Stop
-              Write-Host "Cody: User '$adminUsername' already exists."
-              
-              if (!$existingUser.Enabled) {
-                  Enable-LocalUser -Name $adminUsername
-                  Write-Host "Cody: User '$adminUsername' enabled."
-              }
-          }
-          catch {
-              Write-Host "Cody: Creating new user '$adminUsername'..."
-              try {
-                  $securePassword = ConvertTo-SecureString -String $rdPass -AsPlainText -Force
-                  New-LocalUser -Name $adminUsername `
-                      -Password $securePassword `
-                      -FullName "Cody Admin User" `
-                      -Description "Local admin for RustDesk" `
-                      -AccountNeverExpires `
-                      -PasswordNeverExpires
-              }
-              catch {
-                  Write-Error "Cody: Failed to create user: $_"
-                  exit 1
-              }
-          }
-          
-          Write-Host "Cody: Validating credentials..."
-          try {
-              Add-Type -AssemblyName System.DirectoryServices.AccountManagement
-              $contextType = [System.DirectoryServices.AccountManagement.ContextType]::Machine
-              $principalContext = New-Object System.DirectoryServices.AccountManagement.PrincipalContext($contextType)
-              
-              if ($principalContext.ValidateCredentials($adminUsername, $rdPass)) {
-                  Write-Host "Cody: ✓ Password validated successfully"
-              } else {
-                  Write-Error "Cody: Password validation failed"
-                  exit 1
-              }
-          }
-          catch {
-              Write-Error "Cody: Validation error: $_"
-              exit 1
-          }
-          
-          try {
-              Add-LocalGroupMember -Group "Administrators" -Member $adminUsername -ErrorAction SilentlyContinue
-              Write-Host "Cody: ✓ User added to Administrators"
-          }
-          catch {
-              Write-Host "Cody: User already in Administrators"
-          }
-          
-          Add-Content -Path $env:GITHUB_ENV -Value "ADMIN_USER=$adminUsername"
-
-      - name: Cody - Configure RustDesk Password
-        env:
-          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORDD }}
-        run: |
-          $rdPass = $env:RUSTDESK_PASSWORD
-          $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
-          
-          Write-Host "========================================"
-          Write-Host "Cody: Configuring RustDesk Password..."
-          Write-Host "========================================"
-          
-          if ([string]::IsNullOrWhiteSpace($rdPass)) {
-              Write-Error "Cody: Password is empty"
-              exit 1
-          }
-          
-          try {
-              $service = Get-Service -Name "RustDesk" -ErrorAction Stop
-              Write-Host "Cody: ✓ RustDesk service found"
-          }
-          catch {
-              Write-Error "Cody: RustDesk service not found: $_"
-              exit 1
-          }
-          
-          Write-Host "Cody: Step 1 - Stopping RustDesk service..."
-          try {
-              Stop-Service -Name "RustDesk" -ErrorAction Stop
-              Start-Sleep -Seconds 2
-              Write-Host "Cody: ✓ Service stopped"
-          }
-          catch {
-              Write-Warning "Cody: Could not stop service: $_"
-          }
-          
-          Write-Host "Cody: Step 2 - Creating TOML configuration with password..."
-          $tomlContent = @"
-[options]
-permanent-password = '$rdPass'
-verification-method = 'use-both-passwords'
-approve-mode = 'both'
-allow-remote-config-modification = 'Y'
-allow-logon-screen-password = 'Y'
-"@
-          
-          $configPaths = @(
-              "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config",
-              "$env:APPDATA\RustDesk\config"
-          )
-          
-          foreach ($path in $configPaths) {
-              if (!(Test-Path $path)) {
-                  New-Item -ItemType Directory -Path $path -Force | Out-Null
-              }
-              $tomlPath = Join-Path $path "RustDesk2.toml"
-              Set-Content -Path $tomlPath -Value $tomlContent -Force
-              Write-Host "Cody: ✓ Config written to: $tomlPath"
-          }
-          
-          Write-Host "Cody: Step 3 - Starting RustDesk service..."
-          try {
-              Start-Service -Name "RustDesk" -ErrorAction Stop
-              Write-Host "Cody: ✓ Service started"
-              Start-Sleep -Seconds 5
-          }
-          catch {
-              Write-Error "Cody: Failed to start service: $_"
-              exit 1
-          }
-          
-          Write-Host "Cody: Step 4 - Setting password via CLI while service is running..."
-          try {
-              Push-Location "C:\Program Files\RustDesk"
-              
-              Write-Host "Cody: Executing: rustdesk.exe --password <PASSWORD>"
-              $output = & .\rustdesk.exe --password $rdPass 2>&1
-              Write-Host "Cody: Password output: $output"
-              
-              Write-Host "Cody: ✓ Password set via CLI"
-              Pop-Location
-          }
-          catch {
-              Write-Warning "Cody: CLI password setting warning: $_"
-          }
-          
-          Write-Host "Cody: Step 5 - Restarting service to apply changes..."
-          try {
-              Restart-Service -Name "RustDesk" -ErrorAction Stop
-              Write-Host "Cody: ✓ Service restarted"
-              Start-Sleep -Seconds 8
-          }
-          catch {
-              Write-Error "Cody: Failed to restart service: $_"
-              exit 1
-          }
-          
-          Write-Host "Cody: Step 6 - Verifying configuration..."
-          $serviceStatus = (Get-Service -Name "RustDesk").Status
-          Write-Host "Cody: Service Status: $serviceStatus"
-          
-          if ($serviceStatus -ne 'Running') {
-              Write-Error "Cody: Service is not running after restart"
-              exit 1
-          }
-          
-          $rdProcess = Get-Process -Name "rustdesk" -ErrorAction SilentlyContinue
-          if ($rdProcess) {
-              Write-Host "Cody: ✓ RustDesk process running (PID: $($rdProcess.Id))"
-          }
-          
-          Write-Host "========================================"
-          Write-Host "Cody: ✓ Password configuration completed!"
-          Write-Host "========================================"
-
-      - name: Cody - Get RustDesk ID
-        run: |
-          Write-Host "Cody: Retrieving RustDesk ID..."
-          
-          $id = ""
-          $retries = 0
-          $maxRetries = 20
-          
-          while ([string]::IsNullOrWhiteSpace($id) -and $retries -lt $maxRetries) {
-              try {
-                  Push-Location "C:\Program Files\RustDesk"
-                  $id = (& .\rustdesk.exe --get-id 2>&1 | Out-String).Trim()
-                  Pop-Location
-                  
-                  if ([string]::IsNullOrWhiteSpace($id)) {
-                      Write-Host "Cody: ID not ready (Attempt $($retries + 1)/$maxRetries), waiting..."
-                      Start-Sleep -Seconds 2
-                  } else {
-                      Write-Host "Cody: ✓ ID retrieved successfully"
-                  }
-              }
-              catch {
-                  Write-Host "Cody: Error getting ID: $_"
-              }
-              
-              $retries++
-          }
-          
-          if ([string]::IsNullOrWhiteSpace($id)) {
-              Write-Error "Cody: Failed to retrieve RustDesk ID after $maxRetries attempts"
-              exit 1
-          }
-          
-          Write-Host "========================================"
-          Write-Host "CODY RUSTDESK ID : $id"
-          Write-Host "CODY PASSWORD    : [HIDDEN FOR SECURITY]"
-          Write-Host "========================================"
-          
-          Add-Content -Path $env:GITHUB_ENV -Value "RUSTDESK_ID=$id"
-
-      - name: Cody - Session
+      # Step 4: Keep the session alive
+      - name: Cody - Session Active
         run: |
           $hours = [int]"${{ github.event.inputs.session_duration }}"
           if ($hours -gt 6) { $hours = 6 }
           $seconds = $hours * 3600
           
+          Write-Host ""
           Write-Host "========================================"
-          Write-Host "Cody: RUNNER IS ACTIVE AND READY"
+          Write-Host "CODY IS READY"
           Write-Host "RustDesk ID: $env:RUSTDESK_ID"
-          Write-Host "Session Duration: $hours hour(s)"
+          Write-Host "Running as: codyuser"
+          Write-Host "Session: $hours hour(s)"
           Write-Host "========================================"
           Write-Host ""
-          Write-Host "CONNECT NOW using the RustDesk ID above"
-          Write-Host "Password: (as set in secret)"
-          Write-Host ""
-          Write-Host "========================================"
           
-          $startTime = Get-Date
-          $elapsedMinutes = 0
+          $start = Get-Date
+          $count = 0
           
-          while (((Get-Date) - $startTime).TotalSeconds -lt $seconds) {
+          while (((Get-Date) - $start).TotalSeconds -lt $seconds) {
               Start-Sleep -Seconds 60
-              $elapsedMinutes++
-              if ($elapsedMinutes % 5 -eq 0) {
-                  $remainingTime = [math]::Round(($seconds - ((Get-Date) - $startTime).TotalSeconds) / 60, 0)
-                  Write-Host "Cody: Session active... $remainingTime minutes remaining"
+              $count++
+              if ($count % 5 -eq 0) {
+                  $remaining = [math]::Round(($seconds - ((Get-Date) - $start).TotalSeconds) / 60)
+                  Write-Host "Cody: Running... $remaining minutes left"
               }
           }
           
-          Write-Host "========================================"
-          Write-Host "Cody: Session ended"
-          Write-Host "========================================"
+          Write-Host "Session ended"
