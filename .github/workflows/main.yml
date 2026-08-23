@@ -214,39 +214,33 @@ jobs:
           Write-Host "Cody: Creating configuration script..."
           $tempScript = "$env:TEMP\rustdesk_config_$([System.DateTime]::Now.Ticks).ps1"
           
-          $scriptContent = @"
-          Write-Host "Cody: Running RustDesk configuration as admin user..."
-          `$rdExe = "$rdExe"
-          `$rdPass = "$rdPass"
+          $line1 = 'Write-Host "Cody: Running RustDesk configuration as admin user..."'
+          $line2 = '$rdExe = "' + $rdExe + '"'
+          $line3 = '$rdPass = "' + $rdPass + '"'
+          $line4 = 'try {'
+          $line5 = '    Write-Host "Cody: Setting verification method..."'
+          $line6 = '    & $rdExe --option verification-method use-both-passwords'
+          $line7 = '    Write-Host "Cody: Setting approve mode..."'
+          $line8 = '    & $rdExe --option approve-mode both'
+          $line9 = '    Write-Host "Cody: Setting password..."'
+          $line10 = '    & $rdExe --password $rdPass'
+          $line11 = '    Write-Host "Cody: Configuration completed successfully."'
+          $line12 = '}'
+          $line13 = 'catch {'
+          $line14 = '    Write-Error "Cody: Configuration failed: $_"'
+          $line15 = '    exit 1'
+          $line16 = '}'
           
-          try {
-              Write-Host "Cody: Setting verification method..."
-              & `$rdExe --option verification-method use-both-passwords
-              
-              Write-Host "Cody: Setting approve mode..."
-              & `$rdExe --option approve-mode both
-              
-              Write-Host "Cody: Setting password..."
-              & `$rdExe --password `$rdPass
-              
-              Write-Host "Cody: Configuration completed successfully."
-          }
-          catch {
-              Write-Error "Cody: Configuration failed: `$_"
-              exit 1
-          }
-"@
+          $scriptLines = @($line1, $line2, $line3, $line4, $line5, $line6, $line7, $line8, $line9, $line10, $line11, $line12, $line13, $line14, $line15, $line16)
+          $scriptLines -join "`n" | Set-Content -Path $tempScript -Force
           
-          $scriptContent | Set-Content -Path $tempScript -Force
           Write-Host "Cody: Configuration script created at: $tempScript"
           
           Write-Host "Cody: Executing configuration as admin user via runas..."
           try {
-              $runasCmd = "powershell.exe -ExecutionPolicy Bypass -File `"$tempScript`""
-              $runasOutput = runas /user:$computerName\$adminUser /profile $runasCmd 2>&1
-              
-              Write-Host "Cody: Runas output: $runasOutput"
-              Write-Host "Cody: Configuration executed."
+              $runasCmd = "powershell.exe -ExecutionPolicy Bypass -File ""$tempScript"""
+              $process = Start-Process -FilePath "runas.exe" -ArgumentList "/user:$computerName\$adminUser /profile $runasCmd" -Wait -NoNewWindow -PassThru
+              Write-Host "Cody: Configuration executed (Exit Code: $($process.ExitCode))"
           }
           catch {
               Write-Warning "Cody: Runas execution issue: $_"
