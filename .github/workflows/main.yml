@@ -39,12 +39,154 @@ jobs:
               $timeout++
           }
 
+      - name: Cody - Create Admin User
+        env:
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORDD }}
+        run: |
+          $rdPass = $env:RUSTDESK_PASSWORD
+          
+          # Verify password is not empty
+          if ([string]::IsNullOrWhiteSpace($rdPass)) {
+              Write-Error "Cody: RUSTDESK_PASSWORD secret is empty or not configured in GitHub Secrets."
+              exit 1
+          }
+          
+          $adminUsername = "admin"
+          Write-Host "========================================"
+          Write-Host "Cody: Creating local admin user..."
+          Write-Host "========================================"
+          
+          # Check if user already exists
+          try {
+              $existingUser = Get-LocalUser -Name $adminUsername -ErrorAction Stop
+              Write-Host "Cody: User '$adminUsername' already exists. Checking status..."
+              
+              # Check if user is enabled
+              if ($existingUser.Enabled) {
+                  Write-Host "Cody: User '$adminUsername' is enabled and ready."
+              } else {
+                  Write-Host "Cody: User '$adminUsername' is disabled. Enabling..."
+                  Enable-LocalUser -Name $adminUsername
+                  Write-Host "Cody: User '$adminUsername' has been enabled."
+              }
+          }
+          catch {
+              # User doesn't exist, create it
+              Write-Host "Cody: User '$adminUsername' does not exist. Creating..."
+              
+              try {
+                  $securePassword = ConvertTo-SecureString -String $rdPass -AsPlainText -Force
+                  New-LocalUser -Name $adminUsername `
+                      -Password $securePassword `
+                      -FullName "Cody Admin User" `
+                      -Description "Local admin account for RustDesk" `
+                      -AccountNeverExpires `
+                      -PasswordNeverExpires
+                  
+                  Write-Host "Cody: User '$adminUsername' created successfully."
+              }
+              catch {
+                  Write-Error "Cody: Failed to create user: $_"
+                  exit 1
+              }
+          }
+          
+          # Verify user creation
+          Write-Host "Cody: Verifying user creation..."
+          try {
+              $user = Get-LocalUser -Name $adminUsername -ErrorAction Stop
+              Write-Host "Cody: ✓ User exists: $($user.Name)"
+              Write-Host "Cody: ✓ User Enabled: $($user.Enabled)"
+              Write-Host "Cody: ✓ User Account Type: $($user.ObjectClass)"
+          }
+          catch {
+              Write-Error "Cody: Failed to verify user creation: $_"
+              exit 1
+          }
+          
+          # Verify password by validating credentials
+          Write-Host "Cody: Validating password credentials..."
+          try {
+              Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+              $contextType = [System.DirectoryServices.AccountManagement.ContextType]::Machine
+              $principalContext = New-Object System.DirectoryServices.AccountManagement.PrincipalContext($contextType)
+              
+              $isPasswordValid = $principalContext.ValidateCredentials($adminUsername, $rdPass)
+              
+              if ($isPasswordValid) {
+                  Write-Host "Cody: ✓ Password validation successful"
+              } else {
+                  Write-Error "Cody: Password validation failed. Password may be incorrect."
+                  exit 1
+              }
+          }
+          catch {
+              Write-Error "Cody: Failed to validate credentials: $_"
+              exit 1
+          }
+          
+          # Add user to Administrators group
+          Write-Host "Cody: Adding user to Administrators group..."
+          try {
+              Add-LocalGroupMember -Group "Administrators" -Member $adminUsername -ErrorAction SilentlyContinue
+              Write-Host "Cody: ✓ User added to Administrators group"
+          }
+          catch {
+              Write-Warning "Cody: User may already be in Administrators group or error occurred: $_"
+          }
+          
+          # Final verification checks
+          Write-Host "Cody: Running final verification checks..."
+          $finalUser = Get-LocalUser -Name $adminUsername
+          
+          if (!$finalUser.Enabled) {
+              Write-Error "Cody: User account is disabled. Cannot proceed."
+              exit 1
+          }
+          
+          # Check if user is in Administrators group
+          $adminGroup = Get-LocalGroup -Name "Administrators"
+          $isAdmin = Get-LocalGroupMember -Group $adminGroup | Where-Object { $_.Name -like "*$adminUsername" }
+          
+          if ($isAdmin) {
+              Write-Host "Cody: ✓ User is member of Administrators group"
+          } else {
+              Write-Warning "Cody: User is not in Administrators group. Attempting to add..."
+              try {
+                  Add-LocalGroupMember -Group "Administrators" -Member $adminUsername -Force
+                  Write-Host "Cody: ✓ User added to Administrators group (forced)"
+              }
+              catch {
+                  Write-Error "Cody: Failed to add user to Administrators: $_"
+                  exit 1
+              }
+          }
+          
+          Write-Host "========================================"
+          Write-Host "Cody: Admin user setup completed successfully!"
+          Write-Host "========================================"
+          
+          Add-Content -Path $env:GITHUB_ENV -Value "ADMIN_USER=$adminUsername"
+          Add-Content -Path $env:GITHUB_ENV -Value "ADMIN_PASSWORD=$rdPass"
+
       - name: Cody - Config
         env:
           RUSTDESK_PASSWORDD: ${{ secrets.RUSTDESK_PASSWORDD }}
+          ADMIN_USER: ${{ env.ADMIN_USER }}
+          ADMIN_PASSWORD: ${{ env.ADMIN_PASSWORD }}
         run: |
           $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
           $rdPass = $env:RUSTDESK_PASSWORDD
+          $adminUser = $env:ADMIN_USER
+          
+          if ([string]::IsNullOrWhiteSpace($rdPass)) {
+              Write-Error "Cody: RUSTDESK_PASSWORDD secret is empty or not configured."
+              exit 1
+          }
+          
+          Write-Host "========================================"
+          Write-Host "Cody: Configuring RustDesk as admin user..."
+          Write-Host "========================================"
           
           # Verify that the secret was actually retrieved
           if ([string]::IsNullOrWhiteSpace($rdPass)) {
@@ -85,31 +227,75 @@ jobs:
               $tomlContent | Set-Content $tomlPath -Force
           }
           
-          # 3. Change directory to RustDesk and set password and options via CLI
-          Push-Location "C:\Program Files\RustDesk"
+          # 3. Change directory to RustDesk and set password and options via CLI using runas
+          Write-Host "Cody: Setting options and password as admin user via runas..."
           
-          Write-Host "Cody: Setting options via CLI..."
-          & .\rustdesk.exe --option verification-method use-both-passwords | Out-Null
-          & .\rustdesk.exe --option approve-mode both | Out-Null
+          # Create a temporary PowerShell script to run as the admin user
+          $tempScript = "$env:TEMP\rustdesk_config_$([System.DateTime]::Now.Ticks).ps1"
           
-          Write-Host "Cody: Setting Password..."
-          & .\rustdesk.exe --password $rdPass | Out-Null
+          @"
+          `$rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
+          `$rdPass = "$rdPass"
           
-          Pop-Location
+          Write-Host "Cody: Running RustDesk configuration as admin user..."
+          
+          try {
+              Write-Host "Cody: Setting verification method..."
+              & `$rdExe --option verification-method use-both-passwords
+              
+              Write-Host "Cody: Setting approve mode..."
+              & `$rdExe --option approve-mode both
+              
+              Write-Host "Cody: Setting password..."
+              & `$rdExe --password `$rdPass
+              
+              Write-Host "Cody: Configuration completed."
+          }
+          catch {
+              Write-Error "Cody: Configuration failed: `$_"
+              exit 1
+          }
+"@ | Set-Content -Path $tempScript -Force
+          
+          # Run the script as the admin user using runas
+          try {
+              $runasCmd = "powershell.exe -ExecutionPolicy Bypass -File `"$tempScript`""
+              runas /user:$env:COMPUTERNAME\$adminUser /profile "$runasCmd"
+              
+              Write-Host "Cody: Configuration script executed as admin user."
+          }
+          catch {
+              Write-Warning "Cody: Error running config as admin user: $_"
+              Write-Host "Cody: Attempting alternative configuration method..."
+              
+              # Fallback: Configure from current process
+              Push-Location "C:\Program Files\RustDesk"
+              & .\rustdesk.exe --option verification-method use-both-passwords | Out-Null
+              & .\rustdesk.exe --option approve-mode both | Out-Null
+              & .\rustdesk.exe --password $rdPass | Out-Null
+              Pop-Location
+          }
           
           Write-Host "Cody: Restarting Service..."
           Restart-Service -Name "RustDesk" -Force
-          Start-Sleep -Seconds 15 # Give it time to connect to the network
+          Start-Sleep -Seconds 15
           
           # 4. Retrieve ID
+          Write-Host "Cody: Retrieving RustDesk ID..."
           Push-Location "C:\Program Files\RustDesk"
-          Write-Host "Cody: Retrieving ID..."
           $id = ""
           $retries = 0
           while ([string]::IsNullOrWhiteSpace($id) -and $retries -lt 10) {
-              $id = (& .\rustdesk.exe --get-id | Out-String).Trim()
-              if ([string]::IsNullOrWhiteSpace($id)) {
-                  Write-Host "Cody: ID not ready, waiting..."
+              try {
+                  $id = (& .\rustdesk.exe --get-id | Out-String).Trim()
+                  if ([string]::IsNullOrWhiteSpace($id)) {
+                      Write-Host "Cody: ID not ready, waiting... (Attempt $($retries + 1)/10)"
+                      Start-Sleep -Seconds 5
+                      $retries++
+                  }
+              }
+              catch {
+                  Write-Warning "Cody: Error retrieving ID: $_"
                   Start-Sleep -Seconds 5
                   $retries++
               }
@@ -119,14 +305,18 @@ jobs:
           Write-Host "========================================"
           Write-Host "CODY RUSTDESK ID : $id"
           Write-Host "CODY PASSWORD    : [HIDDEN FOR SECURITY]"
+          Write-Host "CODY ADMIN USER  : $adminUser"
           Write-Host "========================================"
           
           if ([string]::IsNullOrWhiteSpace($id)) {
-              Write-Error "Cody could not retrieve a valid ID."
+              Write-Error "Cody: Could not retrieve a valid ID after 10 attempts."
               exit 1
           }
           
           Add-Content -Path $env:GITHUB_ENV -Value "RUSTDESK_ID=$id"
+          
+          # Cleanup
+          Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
 
       - name: Cody - Session
         run: |
@@ -134,11 +324,24 @@ jobs:
           if ($hours -gt 6) { $hours = 6 }
           $seconds = $hours * 3600
           
+          Write-Host "========================================"
           Write-Host "Cody: Runner is active. Connection details above."
           Write-Host "Cody: Session will end in $hours hour(s)."
+          Write-Host "========================================"
           
           # Use a loop to keep Cody alive and provide feedback in the log
           $startTime = Get-Date
+          $elapsedMinutes = 0
+          
           while (((Get-Date) - $startTime).TotalSeconds -lt $seconds) {
               Start-Sleep -Seconds 60
+              $elapsedMinutes++
+              if ($elapsedMinutes % 5 -eq 0) {
+                  $remainingTime = [math]::Round(($seconds - ((Get-Date) - $startTime).TotalSeconds) / 60, 0)
+                  Write-Host "Cody: Session active... $remainingTime minutes remaining"
+              }
           }
+          
+          Write-Host "========================================"
+          Write-Host "Cody: Session timeout reached. Ending workflow."
+          Write-Host "========================================"
