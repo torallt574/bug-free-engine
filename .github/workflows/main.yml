@@ -71,23 +71,36 @@ jobs:
           secedit /configure /db secedit.sdb /cfg $secpolPath /areas USER_RIGHTS | Out-Null
           Write-Host "Cody: Rights granted"
 
-      # Step 3: Download and install RustDesk (as admin)
+      # Step 3: Install RustDesk (as admin) – same as original fast method
       - name: Cody - Install RustDesk
         run: |
+          $rdUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-x86_64.exe"
+          $installer = "$env:TEMP\rustdesk_installer.exe"
           Write-Host "Cody: Downloading RustDesk..."
-          $installer = "$env:TEMP\rustdesk.exe"
-          Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-x86_64.exe" -OutFile $installer
+          Invoke-WebRequest -Uri $rdUrl -OutFile $installer
           
-          Write-Host "Cody: Installing RustDesk..."
-          Start-Process -FilePath $installer -ArgumentList "--silent-install" -Wait -NoNewWindow
-          Start-Sleep -Seconds 15
+          Write-Host "Cody: Starting Silent Install (Waiting for completion)..."
+          $process = Start-Process -FilePath $installer -ArgumentList "--silent-install" -PassThru -NoNewWindow
+          $process.WaitForExit()
           
-          Write-Host "Cody: Verifying installation..."
-          if (!(Test-Path "C:\Program Files\RustDesk\rustdesk.exe")) {
-              Write-Error "Cody: RustDesk installation failed"
+          Write-Host "Cody: Waiting for service installation to complete..."
+          $timeout = 0
+          while (!(Get-Service -Name "RustDesk" -ErrorAction SilentlyContinue) -and $timeout -lt 30) {
+              Start-Sleep -Seconds 2
+              $timeout++
+          }
+          
+          $timeout = 0
+          while ((Get-Service -Name "RustDesk").Status -ne 'Running' -and $timeout -lt 30) {
+              Start-Sleep -Seconds 2
+              $timeout++
+          }
+          
+          if (!(Get-Service -Name "RustDesk" -ErrorAction SilentlyContinue)) {
+              Write-Error "Cody: RustDesk service not installed."
               exit 1
           }
-          Write-Host "Cody: Installation verified"
+          Write-Host "Cody: Installation complete."
 
       # Step 4: Configure RustDesk service to run as codyuser
       - name: Cody - Configure Service
@@ -106,7 +119,7 @@ jobs:
           $credential = New-Object System.Management.Automation.PSCredential($fullUsername, $securePassword)
           
           Set-Service -Name "RustDesk" -Credential $credential
-          Write-Host "Cody: Service credential updated"
+          Write-Host "Cody: Service credential updated."
 
       # Step 5: Set RustDesk password as codyuser (via CLI)
       - name: Cody - Set RustDesk Password
@@ -116,7 +129,7 @@ jobs:
           $computerName = $env:COMPUTERNAME
           $fullUsername = "$computerName\$username"
           
-          # Write a small script to run as codyuser
+          # Script to run as codyuser
           $scriptContent = @'
           Write-Host "Cody: Setting RustDesk password via CLI..."
           $password = $env:CODY_PASS
